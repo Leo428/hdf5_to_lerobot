@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+slurm_logs/
+*.out
+*.err
+*.log
+.venv/
+*_venv/
+/scratch/
+.DS_Store
