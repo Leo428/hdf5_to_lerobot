@@ -8,3 +8,4 @@ slurm_logs/
 *_venv/
 /scratch/
 .DS_Store
+*.bak
