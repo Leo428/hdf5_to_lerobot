@@ -27,8 +27,9 @@ annotations. So we keep the proven pose/gripper/offset math verbatim and change 
 
   3. NEW per-frame boolean feature ``is_intervention``: True where frame index ``i`` appears in
      ``metadata/interventions`` (the DAgger human-takeover steps). Datasets without that key
-     (clean / non-correction rounds) get all-False. The flag labels timestep ``i`` and is NOT
-     B1-shifted.
+     (clean / full_success autonomous rounds) get all-False. EXCEPTION: round0 dirs are pure human
+     teleop (every frame human-recorded) -> ``--all-human-intervention`` (auto-on when ``round0`` is
+     in the repo_id) forces all-True. The flag labels timestep ``i`` and is NOT B1-shifted.
 
 Gripper (D6, unchanged from npz): ``target_gripper_pos`` is dead (constant), so we replay
 ``rmp_env.py`` step: ``dg = action[grip]``; if ``|dg| > 0.05`` the env commands
@@ -145,12 +146,15 @@ def shift_pose_b1(pose6d: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------------------------
 # HDF5 episode loader.
 # ---------------------------------------------------------------------------------------------
-def load_episode(h5_path: Path, decode_workers: int = 16):
+def load_episode(h5_path: Path, decode_workers: int = 16, all_human: bool = False):
     """Return (images_per_cam, state (T,20), action (T,20), is_intervention (T,), T) or None.
 
     state[i]  = [pos(3), 6D(6), gripper_pos(1)] per arm (L,R): absolute world target + achieved grip.
     action[i] = [pos(3), 6D(6), gripper_target(1)] per arm: pose = state_pose[i+1] (B1), gripper =
                 env-formula reconstructed absolute command (D6).
+
+    ``all_human=True`` marks ALL frames ``is_intervention=True`` (round0 dirs are pure human teleop,
+    so every frame is human-recorded even though no ``metadata/interventions`` key exists).
     """
     with h5py.File(h5_path, "r") as h:
         T = int(h["actions/global_action"].shape[0])
@@ -170,11 +174,15 @@ def load_episode(h5_path: Path, decode_workers: int = 16):
         raw_actions = np.asarray(h["actions/global_action"], dtype=np.float32)  # (T,14)
 
         # Per-frame intervention flag (absent on clean rounds -> all False). Labels timestep i; not shifted.
-        is_interv = np.zeros(T, dtype=bool)
-        if "metadata/interventions" in h:
-            iv = np.asarray(h["metadata/interventions"]).ravel().astype(np.int64)
-            iv = iv[(iv >= 0) & (iv < T)]
-            is_interv[iv] = True
+        # round0 (all_human) = pure human teleop -> every frame is human-recorded, so force all True.
+        if all_human:
+            is_interv = np.ones(T, dtype=bool)
+        else:
+            is_interv = np.zeros(T, dtype=bool)
+            if "metadata/interventions" in h:
+                iv = np.asarray(h["metadata/interventions"]).ravel().astype(np.int64)
+                iv = iv[(iv >= 0) & (iv < T)]
+                is_interv[iv] = True
 
         # Read the (zero-padded) JPEG rows for the 3 kept cameras as whole arrays (1 contiguous
         # NFS read each) before leaving the h5 context.
@@ -262,14 +270,21 @@ def convert(
     prompt: str = DEFAULT_PROMPT,
     max_episodes: int | None = None,
     *,
+    all_human_intervention: bool = False,
     push_to_hub: bool = False,
 ):
-    """Convert one dir of dual-xArm ``episode_*.hdf5`` to a LeRobot v2 dataset (1 episode each)."""
+    """Convert one dir of dual-xArm ``episode_*.hdf5`` to a LeRobot v2 dataset (1 episode each).
+
+    ``--all-human-intervention`` forces ``is_intervention=True`` on every frame (use for round0 /
+    pure-human-teleop dirs). It is auto-enabled when ``round0`` appears in ``repo_id``.
+    """
     raw_dir = Path(raw_dir)
+    all_human = all_human_intervention or ("round0" in repo_id.lower())
     files = episode_files(raw_dir)
     if max_episodes is not None:
         files = files[:max_episodes]
-    print(f"[{repo_id}] {len(files)} episodes from {raw_dir}  ->  {HF_LEROBOT_HOME / repo_id}")
+    print(f"[{repo_id}] {len(files)} episodes from {raw_dir}  ->  {HF_LEROBOT_HOME / repo_id}"
+          f"{'  [ALL-HUMAN: is_intervention=True for every frame]' if all_human else ''}")
 
     dataset = create_empty_dataset(repo_id)
     episodes_written = 0
@@ -280,7 +295,7 @@ def convert(
 
     for h5_path in tqdm.tqdm(files, desc=f"Converting {repo_id}"):
         try:
-            loaded = load_episode(h5_path)
+            loaded = load_episode(h5_path, all_human=all_human)
         except Exception as e:  # noqa: BLE001 -- robustness: skip a bad file, keep going.
             skipped.append((h5_path.name, f"load error: {type(e).__name__}: {e}"))
             continue
